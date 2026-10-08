@@ -4,7 +4,7 @@ WORKDIR /app
 
 RUN pip install --no-cache-dir snowballstemmer fastembed numpy
 
-COPY kb.sqlite server.py index.html /app/
+COPY kb.sqlite server.py search.py index.html /app/
 
 # Ключ доступа задаётся переменной окружения RAG_ACCESS_KEY в настройках Space.
 # HF предоставляет порт в переменной PORT; по умолчанию 7860.
