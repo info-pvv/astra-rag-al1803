@@ -1,0 +1,547 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Веб-сервер RAG-базы по курсу AL-1803 (Astra Linux SE 1.8).
+
+Только стандартная библиотека Python + модуль search.py (тот же каталог).
+Слушает 127.0.0.1 — доступен исключительно с локальной машины.
+
+Запуск:
+    python server.py                 # http://127.0.0.1:8180
+    python server.py --port 9000
+
+API:
+    GET  /                    страница-интерфейс (index.html)
+    GET  /api/health          состояние базы
+    POST /api/ask             {"query": "...", "k": 5}      — вопрос по курсу
+    POST /api/quiz            {"question": "...", "options": ["...", ...]}
+                              — выбор правильного варианта
+    GET  /api/page?doc=&page= полный текст страницы документа
+"""
+import argparse
+import base64
+import hashlib
+import hmac
+import json
+import os
+import re
+import sqlite3
+import sys
+import threading
+import webbrowser
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import search as S  # noqa: E402  (модуль поиска рядом: kb.sqlite, стемминг, RRF)
+
+HERE = Path(__file__).resolve().parent
+DB_PATH = HERE / "kb.sqlite"
+PORT = 8180
+
+# Ключ доступа читается только из переменной окружения RAG_ACCESS_KEY
+# (задаётся в настройках Space/хостинга). Если не установлен — доступ без пароля.
+ACCESS_KEY = os.environ.get("RAG_ACCESS_KEY", "").strip()
+
+
+def check_access(req_key: str) -> bool:
+    """Постоянное (constant-time) сравнение введённого ключа с заданным."""
+    if not ACCESS_KEY:
+        return True
+    given = hashlib.sha256((req_key or "").encode("utf-8")).digest()
+    expected = hashlib.sha256(ACCESS_KEY.encode("utf-8")).digest()
+    return hmac.compare_digest(given, expected)
+
+# ---------------------------------------------------------------- состояние
+_lock = threading.Lock()
+VEC_IDS = None          # список id чанков с векторами
+VEC_MAT = None          # нормированная матрица векторов (numpy), или None
+VEC_ERR = ""            # причина недоступности векторов
+META = {}
+
+
+def load_once():
+    """Однократная загрузка векторов и метаданных базы в память."""
+    global VEC_IDS, VEC_MAT, VEC_ERR, META
+    con = sqlite3.connect(DB_PATH)
+    try:
+        META = dict(con.execute("SELECT key, value FROM meta").fetchall())
+    except sqlite3.Error:
+        META = {}
+    try:
+        VEC_IDS, VEC_MAT = S.load_vectors(con)
+    except Exception as e:                                  # noqa: BLE001
+        VEC_IDS, VEC_MAT, VEC_ERR = None, None, f"{type(e).__name__}: {e}"
+    con.close()
+
+
+def db():
+    return sqlite3.connect(DB_PATH)
+
+
+# ------------------------------------------------------------------ поиск
+def fts_hits(con, query, limit, doc_filter=None):
+    expr = S.fts_expr(query)
+    if not expr:
+        return []
+    sql = ("SELECT c.id, c.doc, c.page_start, c.page_end, c.section, c.text, "
+           "bm25(fts) AS b FROM fts JOIN chunks c ON c.id = fts.rowid "
+           "WHERE fts MATCH ?")
+    params = [expr]
+    if doc_filter:
+        sql += " AND c.doc LIKE ?"
+        params.append(f"%{doc_filter}%")
+    sql += " ORDER BY bm25(fts) LIMIT ?"
+    params.append(limit)
+    try:
+        return con.execute(sql, params).fetchall()
+    except sqlite3.OperationalError:
+        return []
+
+
+def vec_hits(con, query, limit, doc_filter=None):
+    """Топ чанков по косинусной близости (если векторы доступны)."""
+    if VEC_MAT is None or VEC_IDS is None:
+        return [], VEC_ERR or "векторы не построены"
+    model = META.get("embed_model") or \
+        "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+    try:
+        qv = S.embed_query(query, model)
+    except Exception as e:                                  # noqa: BLE001
+        return [], f"{type(e).__name__}: {e}"
+    sims = VEC_MAT @ qv
+    order = sims.argsort()[::-1]
+    out = []
+    for i in order:
+        cid = int(VEC_IDS[i])
+        row = con.execute(
+            "SELECT id, doc, page_start, page_end, section, text FROM chunks WHERE id=?",
+            (cid,)).fetchone()
+        if not row:
+            continue
+        if doc_filter and doc_filter.lower() not in row[1].lower():
+            continue
+        out.append((row, float(sims[i])))
+        if len(out) >= limit:
+            break
+    return out, ""
+
+
+def retrieve(con, query, k=6, doc_filter=None):
+    """Гибрид: BM25 + векторы, слияние по RRF. Возвращает список словарей."""
+    pool = max(40, k * 4)
+    fh = fts_hits(con, query, pool, doc_filter)
+    vh, verr = vec_hits(con, query, pool, doc_filter)
+
+    rrf, by_id = {}, {}
+    for rank, row in enumerate(fh, start=1):
+        cid = row[0]
+        rrf[cid] = rrf.get(cid, 0.0) + 1.0 / (60.0 + rank)
+        by_id[cid] = row[:6]
+    for rank, (row, _sim) in enumerate(vh, start=1):
+        cid = row[0]
+        rrf[cid] = rrf.get(cid, 0.0) + 1.0 / (60.0 + rank)
+        by_id[cid] = row
+    ranked = sorted(rrf.items(), key=lambda x: -x[1])[:k]
+
+    hits = []
+    for cid, score in ranked:
+        r = by_id[cid]
+        hits.append({
+            "id": r[0], "doc": r[1], "page_start": r[2], "page_end": r[3],
+            "section": (r[4] or "").strip(), "text": r[5], "score": round(score, 5),
+        })
+    return hits, verr
+
+
+# --------------------------------------------------- сборка ответа на вопрос
+def q_stems(q):
+    out = set()
+    for t in S.TOKEN_RE.findall(q.lower()):
+        if re.fullmatch(r"[0-9][0-9.\-]*", t):
+            out.update(p for p in re.sub(r"[^0-9]+", " ", t).split() if p)
+            continue
+        if len(t) < 3 or t in S.STOP:
+            continue
+        out.add(S.stem(t))
+    return out
+
+
+SENT_RE = re.compile(r"(?<=[.!?;])\s+(?=[A-ZА-ЯЁ0-9a-zа-яё«(])|\n+")
+
+
+def sentences(text):
+    parts = [s.strip() for s in SENT_RE.split(text) if s and s.strip()]
+    return [p for p in parts if len(p) >= 20]
+
+
+def score_sentence(sent, stems):
+    toks = {S.stem(t) for t in S.TOKEN_RE.findall(sent.lower())
+            if len(t) >= 3 and t not in S.STOP}
+    if not toks:
+        return 0.0
+    ov = len(toks & stems)
+    if not ov:
+        return 0.0
+    base = ov / (len(toks) ** 0.5)
+    if ov >= 3:
+        base *= 1.25
+    if re.search(r"\b(команда|выполнить|параметр|командой|следует|необходимо)\b",
+                 sent, re.IGNORECASE):
+        base *= 1.08
+    if re.search(r"[a-zа-яё_\-]+\s+[-–—]\s|\bman\b|/etc/|/var/|/usr/", sent,
+                 re.IGNORECASE):
+        base *= 1.08
+    return base
+
+
+def build_answer(query, k):
+    con = db()
+    try:
+        hits, verr = retrieve(con, query, k=k)
+        if not hits:
+            return {"query": query, "answer": [], "sources": [],
+                    "note": "Ничего не найдено — попробуйте переформулировать запрос."}
+        stems = q_stems(query)
+
+        # кандидаты-предложения по всем найденным чанкам
+        cand = []
+        for h in hits:
+            for idx, s in enumerate(sentences(h["text"])):
+                sc = score_sentence(s, stems)
+                if sc > 0:
+                    cand.append((sc, h, idx, s))
+        cand.sort(key=lambda x: -x[0])
+
+        # отбор с дедупликацией почти одинаковых предложений
+        picked, seen = [], set()
+        for sc, h, idx, s in cand:
+            key = re.sub(r"\W+", " ", s.lower())[:90]
+            if key in seen:
+                continue
+            seen.add(key)
+            picked.append({
+                "text": s, "doc": h["doc"], "page_start": h["page_start"],
+                "page_end": h["page_end"], "section": h["section"],
+                "score": round(sc, 3),
+            })
+            if len(picked) >= min(7, max(3, k)):
+                break
+
+        # источники: чанки с наиболее релевантным сниппетом
+        terms = S.plain_terms(query)
+        sources = []
+        for h in hits[:k]:
+            sources.append({
+                "id": h["id"], "doc": h["doc"],
+                "page_start": h["page_start"], "page_end": h["page_end"],
+                "section": h["section"], "score": h["score"],
+                "snippet": S.make_snippet(h["text"], terms or list(stems), width=700),
+                "text": h["text"],
+            })
+        out = {"query": query, "answer": picked, "sources": sources}
+        if verr:
+            out["note"] = f"Семантический поиск недоступен ({verr}) — использован полнотекстовый."
+        return out
+    finally:
+        con.close()
+
+
+# ------------------------------------------------- оценка вариантов ответа
+def option_support(con, question, option):
+    """Поддержка варианта документацией: BM25 + косинусная близость."""
+    q = f"{question} {option}".strip()
+    fh = fts_hits(con, q, 8)
+    # BM25 в SQLite FTS5: чем меньше — тем лучше; берём сумму по топ-3
+    fts_score = 0.0
+    for _cid, _doc, _p1, _p2, _sec, _txt, b in fh[:3]:
+        fts_score += 1.0 / (1.0 + abs(float(b)))
+
+    vscore = 0.0
+    best_row = None
+    if VEC_MAT is not None:
+        model = META.get("embed_model") or \
+            "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+        try:
+            qv = S.embed_query(q, model)
+            sims = VEC_MAT @ qv
+            idx = sims.argsort()[::-1][:3]
+            vscore = float(sum(sims[i] for i in idx) / len(idx))
+            best_i = int(sims.argmax())
+            best_row = con.execute(
+                "SELECT id, doc, page_start, page_end, section, text FROM chunks WHERE id=?",
+                (int(VEC_IDS[best_i]),)).fetchone()
+        except Exception:                                   # noqa: BLE001
+            vscore = 0.0
+    if best_row is None and fh:
+        best_row = fh[0][:6]
+    return {"fts": fts_score, "vec": vscore, "row": best_row}
+
+
+def build_quiz(question, options):
+    con = db()
+    try:
+        stats = []
+        for i, opt in enumerate(options):
+            s = option_support(con, question, opt)
+            stats.append({"index": i, "option": opt, **s})
+
+        # нормализация двух метрик в [0,1] и объединение
+        def norm(key):
+            vals = [x[key] for x in stats]
+            lo, hi = min(vals), max(vals)
+            span = (hi - lo) or 1.0
+            return [(v - lo) / span for v in vals]
+
+        fn, vn = norm("fts"), norm("vec")
+        for s, f, v in zip(stats, fn, vn):
+            s["combined"] = round(0.5 * f + 0.5 * v, 4)
+
+        order = sorted(stats, key=lambda x: -x["combined"])
+        best, runner = order[0], (order[1] if len(order) > 1 else None)
+        margin = best["combined"] - (runner["combined"] if runner else 0.0)
+
+        terms = S.plain_terms(question + " " + best["option"])
+        row = best["row"]
+        evidence = []
+        if row:
+            evidence = [{
+                "id": row[0], "doc": row[1],
+                "page_start": row[2], "page_end": row[3],
+                "section": (row[4] or "").strip(),
+                "snippet": S.make_snippet(row[5], terms, width=650),
+                "text": row[5],
+            }]
+        # дополнительно: чанки по запросу «вопрос + правильный вариант»
+        for h2 in retrieve(con, f"{question} {best['option']}", k=3)[0]:
+            if row and h2["id"] == row[0]:
+                continue
+            evidence.append({
+                "id": h2["id"], "doc": h2["doc"],
+                "page_start": h2["page_start"], "page_end": h2["page_end"],
+                "section": h2["section"],
+                "snippet": S.make_snippet(h2["text"], terms, width=650),
+                "text": h2["text"],
+            })
+
+        # цитаты: предложения, подтверждающие выбранный вариант
+        stems = q_stems(question + " " + best["option"])
+        quotes = []
+        for ev in evidence:
+            for s in sorted(sentences(ev["text"]),
+                            key=lambda x: -score_sentence(x, stems)):
+                sc = score_sentence(s, stems)
+                if sc <= 0:
+                    continue
+                quotes.append({"text": s, "doc": ev["doc"],
+                               "page_start": ev["page_start"],
+                               "page_end": ev["page_end"],
+                               "section": ev["section"]})
+                break
+            if len(quotes) >= 3:
+                break
+
+        # уверенность по отрыву лидера
+        if margin >= 0.35:
+            conf = "высокая"
+        elif margin >= 0.12:
+            conf = "средняя"
+        else:
+            conf = "низкая"
+
+        return {
+            "question": question,
+            "options": [
+                {"index": s["index"], "text": s["option"],
+                 "combined": s["combined"], "fts": round(s["fts"], 4),
+                 "vec": round(s["vec"], 4),
+                 "is_answer": s["index"] == best["index"]}
+                for s in stats
+            ],
+            "answer_index": best["index"],
+            "answer_text": best["option"],
+            "confidence": conf,
+            "margin": round(margin, 4),
+            "quotes": quotes,
+            "evidence": evidence,
+            "ranking": [s["index"] for s in order],
+        }
+    finally:
+        con.close()
+
+
+# ------------------------------------------------------------------ сервер
+class Handler(BaseHTTPRequestHandler):
+    server_version = "AL1803-RAG/1.0"
+
+    def log_message(self, fmt, *args):                      # тихий лог
+        pass
+
+    def _provided_key(self) -> str:
+        """Ключ из HTTP-заголовка Basic-аутентификации (браузер спрашивает его сам)."""
+        header = self.headers.get("Authorization") or ""
+        if not header.startswith("Basic "):
+            return ""
+        try:
+            decoded = base64.b64decode(header[6:].strip()).decode("utf-8")
+        except Exception:                                   # noqa: BLE001
+            return ""
+        return decoded.split(":", 1)[1] if ":" in decoded else decoded
+
+    def _require_access(self) -> bool:
+        """True — доступ разрешён; иначе отправляет 401 и возвращает False."""
+        if check_access(self._provided_key()):
+            return True
+        body = '{"error": "требуется ключ доступа"}'.encode("utf-8")
+        try:
+            self.send_response(401)
+            self.send_header("WWW-Authenticate", 'Basic realm="Astra RAG"')
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except Exception:                                   # noqa: BLE001
+            pass
+        return False
+
+    def _send(self, code, body: bytes, ctype: str):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _json(self, obj, code=200):
+        self._send(code, json.dumps(obj, ensure_ascii=False).encode("utf-8"),
+                   "application/json; charset=utf-8")
+
+    def _read_json(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(n) if n else b"{}"
+        return json.loads(raw.decode("utf-8") or "{}")
+
+    def do_GET(self):                                       # noqa: N802
+        from urllib.parse import urlparse, parse_qs
+        if not self._require_access():
+            return
+        u = urlparse(self.path)
+        if u.path in ("/", "/index.html"):
+            f = HERE / "index.html"
+            if not f.exists():
+                return self._send(404, b"index.html not found",
+                                  "text/plain; charset=utf-8")
+            return self._send(200, f.read_bytes(), "text/html; charset=utf-8")
+        if u.path == "/api/health":
+            con = db()
+            try:
+                chunks = con.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+                docs = con.execute("SELECT COUNT(DISTINCT doc) FROM chunks").fetchone()[0]
+            finally:
+                con.close()
+            return self._json({"ok": True, "chunks": chunks, "docs": docs,
+                               "vector_search": VEC_MAT is not None,
+                               "meta": META})
+        if u.path == "/api/page":
+            q = parse_qs(u.query)
+            doc = (q.get("doc") or [""])[0]
+            try:
+                page = int((q.get("page") or ["0"])[0])
+            except ValueError:
+                return self._json({"error": "bad page"}, 400)
+            con = db()
+            try:
+                rows = con.execute(
+                    "SELECT page, page_label, text FROM pages "
+                    "WHERE doc LIKE ? AND page=?", (f"%{doc}%", page)).fetchall()
+            finally:
+                con.close()
+            if not rows:
+                return self._json({"error": "not found"}, 404)
+            return self._json({"doc": doc, "page": page,
+                               "label": rows[0][1] or "", "text": rows[0][2]})
+        return self._json({"error": "not found"}, 404)
+
+    def do_POST(self):                                      # noqa: N802
+        from urllib.parse import urlparse
+        if not self._require_access():
+            return
+        path = urlparse(self.path).path
+        try:
+            data = self._read_json()
+        except Exception:                                   # noqa: BLE001
+            return self._json({"error": "invalid JSON"}, 400)
+
+        if path == "/api/ask":
+            q = (data.get("query") or "").strip()
+            if not q:
+                return self._json({"error": "Пустой запрос"}, 400)
+            try:
+                k = int(data.get("k") or 5)
+            except (TypeError, ValueError):
+                k = 5
+            k = max(1, min(15, k))
+            with _lock:
+                res = build_answer(q, k)
+            return self._json(res)
+
+        if path == "/api/quiz":
+            q = (data.get("question") or "").strip()
+            opts = [str(o).strip() for o in (data.get("options") or [])]
+            opts = [o for o in opts if o]
+            if not q or len(opts) < 2:
+                return self._json(
+                    {"error": "Нужны вопрос и минимум два варианта ответа"}, 400)
+            if len(opts) > 10:
+                return self._json({"error": "Слишком много вариантов (макс. 10)"}, 400)
+            with _lock:
+                res = build_quiz(q, opts)
+            return self._json(res)
+
+        return self._json({"error": "not found"}, 404)
+
+
+def main():
+    global PORT
+    ap = argparse.ArgumentParser(description="Веб-сервер RAG-базы AL-1803")
+    ap.add_argument("--port", type=int, default=PORT)
+    ap.add_argument("--no-browser", action="store_true")
+    args = ap.parse_args()
+    PORT = args.port
+
+    if not DB_PATH.exists():
+        sys.exit("База не найдена. Сначала выполните: python build_kb.py --embed")
+
+    print("Загрузка индекса в память...")
+    load_once()
+    print(f"  база: {DB_PATH}")
+    print(f"  чанков: {META.get('chunks', '?')}, собрана: {META.get('built', '?')}")
+    if VEC_MAT is None:
+        print(f"  ! семантический поиск недоступен: {VEC_ERR}")
+    else:
+        print(f"  семантический поиск: включён ({VEC_MAT.shape[0]} векторов)")
+    if ACCESS_KEY:
+        print("  ключ доступа: установлен (переменная RAG_ACCESS_KEY)")
+    else:
+        print("  ключ доступа: НЕ установлен — страница открыта всем")
+
+    srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    url = f"http://127.0.0.1:{PORT}/"
+    print(f"\nОткройте в браузере: {url}\n(остановить — Ctrl+C)")
+    if not args.no_browser:
+        try:
+            webbrowser.open(url)
+        except Exception:                                   # noqa: BLE001
+            pass
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print("\nОстановлено.")
+    finally:
+        srv.server_close()
+
+
+if __name__ == "__main__":
+    main()
