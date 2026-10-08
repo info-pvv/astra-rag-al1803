@@ -40,6 +40,8 @@ import search as S  # noqa: E402  (модуль поиска рядом: kb.sqli
 HERE = Path(__file__).resolve().parent
 DB_PATH = HERE / "kb.sqlite"
 PORT = 8180
+# Адрес привязки: локально 127.0.0.1; в контейнере (Render/Docker) задаётся RAG_HOST=0.0.0.0
+BIND_HOST = os.environ.get("RAG_HOST", "127.0.0.1").strip()
 
 # Ключ доступа читается только из переменной окружения RAG_ACCESS_KEY
 # (задаётся в настройках Space/хостинга). Если не установлен — доступ без пароля.
@@ -527,8 +529,8 @@ def main():
     else:
         print("  ключ доступа: НЕ установлен — страница открыта всем")
 
-    srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
-    url = f"http://127.0.0.1:{PORT}/"
+    srv = ThreadingHTTPServer((BIND_HOST, PORT), Handler)
+    url = f"http://{BIND_HOST}:{PORT}/"
     print(f"\nОткройте в браузере: {url}\n(остановить — Ctrl+C)")
     if not args.no_browser:
         try:
