@@ -72,6 +72,12 @@ def load_once():
         META = dict(con.execute("SELECT key, value FROM meta").fetchall())
     except sqlite3.Error:
         META = {}
+    # На хостинге с малым объёмом RAM (RAG_DISABLE_VEC=1) семантика отключается:
+    # остаётся BM25-поиск, который даёт основное качество.
+    if os.environ.get("RAG_DISABLE_VEC", "").strip() == "1":
+        VEC_IDS, VEC_MAT, VEC_ERR = None, None, "отключён переменной RAG_DISABLE_VEC=1"
+        con.close()
+        return
     try:
         VEC_IDS, VEC_MAT = S.load_vectors(con)
     except Exception as e:                                  # noqa: BLE001
