@@ -49,13 +49,19 @@ ACCESS_KEY = os.environ.get("RAG_ACCESS_KEY", "").strip()
 
 # Карта «название документа → файл PDF» (pdf_map.json рядом с сервером).
 # Файл опционален: без него ссылки на PDF просто не показываются.
+# Поддерживаются алиасы (aliases) — короткие названия документов из базы.
 PDF_MAP = {}
+PDF_ALIAS = {}
 _pdf_map_path = HERE / "pdf_map.json"
 if _pdf_map_path.exists():
     try:
         PDF_MAP = json.loads(_pdf_map_path.read_text(encoding="utf-8"))
+        for _fname, _info in PDF_MAP.items():
+            PDF_ALIAS[_fname] = _fname
+            for _a in (_info.get("aliases") or []):
+                PDF_ALIAS[_a] = _fname
     except Exception:                                       # noqa: BLE001
-        PDF_MAP = {}
+        PDF_MAP, PDF_ALIAS = {}, {}
 
 
 def check_access(req_key: str) -> bool:
@@ -100,10 +106,11 @@ def db():
 
 
 def pdf_ref(doc: str):
-    """Ссылка на PDF документа (если он есть в pdf_map.json), иначе None."""
-    if doc in PDF_MAP:
+    """Ссылка на PDF документа по его названию в базе (через алиасы), иначе None."""
+    fname = PDF_ALIAS.get(doc)
+    if fname:
         from urllib.parse import quote
-        return "/pdf?f=" + quote(doc)
+        return "/pdf?f=" + quote(fname)
     return None
 
 
