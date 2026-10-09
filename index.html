@@ -187,7 +187,10 @@
 <dialog id="dlg">
   <div class="dh">
     <b id="dlgTitle">Фрагмент документа</b>
-    <button class="ghost mini" onclick="document.getElementById('dlg').close()">Закрыть</button>
+    <div style="display:flex;gap:8px">
+      <button class="ghost mini" id="dlgCopy">📋 Копировать</button>
+      <button class="ghost mini" onclick="document.getElementById('dlg').close()">Закрыть</button>
+    </div>
   </div>
   <div class="db" id="dlgBody"></div>
 </dialog>
@@ -231,6 +234,88 @@ function pdfLink(doc) {
   return "";
 }
 
+/* --------------------- промпт для внешней нейросети ---------------------- */
+let lastAsk = null, lastQuiz = null;
+
+function showLlmPrompt(text) {
+  const dlg = $("#dlg");
+  $("#dlgTitle").textContent = "Запрос для нейросети — вставьте в DeepSeek / ChatGPT / GigaChat";
+  $("#dlgBody").textContent = text;
+  dlg.showModal();
+}
+
+$("#dlgCopy").onclick = async () => {
+  const t = $("#dlgBody").textContent;
+  try {
+    await navigator.clipboard.writeText(t);
+    flashCopy("Скопировано ✓");
+  } catch (e) {
+    // запасной способ (не-https контекст)
+    const ta = document.createElement("textarea");
+    ta.value = t; document.body.appendChild(ta); ta.select();
+    try { document.execCommand("copy"); flashCopy("Скопировано ✓"); }
+    catch (e2) { flashCopy("Скопируйте вручную (Ctrl+C)"); }
+    ta.remove();
+  }
+};
+function flashCopy(msg) {
+  const b = $("#dlgCopy"); const old = b.textContent;
+  b.textContent = msg; setTimeout(() => b.textContent = old, 1600);
+}
+
+function ctxBlocks(items, maxChars) {
+  let out = "", i = 0;
+  for (const s of items) {
+    const pg = s.page_start === s.page_end ? `стр. ${s.page_start}` : `стр. ${s.page_start}–${s.page_end}`;
+    const sec = s.section ? ` · ${s.section}` : "";
+    out += `[${++i}] ${s.doc}, ${pg}${sec}\n${(s.text || "").slice(0, maxChars)}\n\n`;
+  }
+  return out;
+}
+
+function llmAsk() {
+  if (!lastAsk) return;
+  const d = lastAsk;
+  const ctx = ctxBlocks((d.sources || []).slice(0, 5), 1500);
+  const prompt =
+`Ты — опытный администратор и преподаватель по курсу «Astra Linux Special Edition 1.8». Ответь на вопрос строго на основе приведённых ниже фрагментов официальной документации (источники обозначены [n]). Правила:
+— опирайся только на эти фрагменты; если их недостаточно для полного ответа — честно скажи, чего не хватает;
+— рядом с каждым утверждением указывай источник в виде [n];
+— структурируй ответ: краткий ответ, затем пояснения по шагам с командами;
+— команды и пути файлов приводи точно как в документации.
+
+Вопрос: ${d.query}
+
+Фрагменты документации:
+
+${ctx}`;
+  showLlmPrompt(prompt);
+}
+window.llmAsk = llmAsk;
+
+function llmQuiz() {
+  if (!lastQuiz) return;
+  const d = lastQuiz;
+  const ctx = ctxBlocks((d.evidence || []).slice(0, 4), 1200);
+  const opts = d.options.map((o, i) => `${String.fromCharCode(1040 + i)}) ${o.text}`).join("\n");
+  const prompt =
+`Ты — эксперт по Astra Linux Special Edition 1.8. Дан вопрос с вариантами ответа. На основе ТОЛЬКО приведённых ниже фрагментов официальной документации:
+1) определи правильный вариант;
+2) обоснуй выбор со ссылками на источники [n];
+3) кратко поясни, почему остальные варианты неверны;
+4) если фрагментов недостаточно для уверенного выбора — так и скажи и укажи, какой документ стоит посмотреть.
+
+Вопрос: ${d.question}
+Варианты ответа:
+${opts}
+
+Фрагменты документации:
+
+${ctx}`;
+  showLlmPrompt(prompt);
+}
+window.llmQuiz = llmQuiz;
+
 /* ------------------------------ состояние базы ---------------------------- */
 fetch("/api/health").then(r => r.json()).then(d => {
   $("#health").textContent = d.ok
@@ -271,6 +356,7 @@ async function ask() {
     });
     const d = await r.json();
     if (d.error) { askOut.innerHTML = `<div class="note">${esc(d.error)}</div>`; return; }
+    lastAsk = d;
     renderAnswer(d);
   } catch (e) {
     askOut.innerHTML = `<div class="note">Ошибка запроса: ${esc(String(e))}</div>`;
@@ -281,8 +367,10 @@ function renderAnswer(d) {
   let h = "";
   if (d.note) h += `<div class="note">${esc(d.note)}</div>`;
 
-  h += `<div class="card"><div class="muted" style="margin-bottom:10px">
-    Наиболее релевантные фрагменты документации по запросу «${esc(d.query)}»:</div>`;
+  h += `<div class="card"><div style="display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:10px">
+    <span class="muted">Наиболее релевантные фрагменты по запросу «${esc(d.query)}»:</span>
+    <button class="ghost mini" onclick="llmAsk()">🤖 Запрос для нейросети</button>
+  </div>`;
   if (!d.answer || !d.answer.length) {
     h += `<div class="muted">Подходящих фрагментов не найдено. Попробуйте другие слова.</div>`;
   } else {
@@ -374,6 +462,7 @@ async function runQuiz() {
     });
     const d = await r.json();
     if (d.error) { out.innerHTML = `<div class="note">${esc(d.error)}</div>`; return; }
+    lastQuiz = d;
     renderQuiz(d, markedIdx);
   } catch (e) {
     out.innerHTML = `<div class="note">Ошибка запроса: ${esc(String(e))}</div>`;
@@ -384,7 +473,10 @@ function renderQuiz(d, markedIdx) {
   const ok = d.confidence === "высокая" ? "ok" : d.confidence === "средняя" ? "mid" : "low";
   const mark = d.options[d.answer_index];
   let h = `<div class="verdict ${ok}">
-    <h3>Уверенность определения: ${esc(d.confidence)} <span class="muted">(отрыв от следующего варианта: ${d.margin})</span></h3>
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:10px">
+      <h3 style="margin:0">Уверенность: ${esc(d.confidence)} <span class="muted">(отрыв: ${d.margin})</span></h3>
+      <button class="ghost mini" onclick="llmQuiz()">🤖 Запрос для нейросети</button>
+    </div>
     <div class="muted">Подтверждается документацией:</div>
     <div class="big">${esc(mark.text)}</div>`;
 
