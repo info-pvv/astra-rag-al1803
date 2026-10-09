@@ -260,6 +260,7 @@ def build_answer(query, k):
             picked.append({
                 "text": s, "doc": h["doc"], "page_start": h["page_start"],
                 "page_end": h["page_end"], "section": h["section"],
+                "pdf_url": h.get("pdf_url"),
                 "score": round(sc, 3),
             })
             if len(picked) >= min(7, max(3, k)):
