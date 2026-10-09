@@ -47,6 +47,16 @@ BIND_HOST = os.environ.get("RAG_HOST", "127.0.0.1").strip()
 # (задаётся в настройках Space/хостинга). Если не установлен — доступ без пароля.
 ACCESS_KEY = os.environ.get("RAG_ACCESS_KEY", "").strip()
 
+# Карта «название документа → файл PDF» (pdf_map.json рядом с сервером).
+# Файл опционален: без него ссылки на PDF просто не показываются.
+PDF_MAP = {}
+_pdf_map_path = HERE / "pdf_map.json"
+if _pdf_map_path.exists():
+    try:
+        PDF_MAP = json.loads(_pdf_map_path.read_text(encoding="utf-8"))
+    except Exception:                                       # noqa: BLE001
+        PDF_MAP = {}
+
 
 def check_access(req_key: str) -> bool:
     """Постоянное (constant-time) сравнение введённого ключа с заданным."""
@@ -87,6 +97,14 @@ def load_once():
 
 def db():
     return sqlite3.connect(DB_PATH)
+
+
+def pdf_ref(doc: str):
+    """Ссылка на PDF документа (если он есть в pdf_map.json), иначе None."""
+    if doc in PDF_MAP:
+        from urllib.parse import quote
+        return "/pdf?f=" + quote(doc)
+    return None
 
 
 # ------------------------------------------------------------------ поиск
@@ -213,6 +231,8 @@ def build_answer(query, k):
             return {"query": query, "answer": [], "sources": [],
                     "note": "Ничего не найдено — попробуйте переформулировать запрос."}
         stems = q_stems(query)
+        for h in hits:
+            h["pdf_url"] = pdf_ref(h["doc"])
 
         # кандидаты-предложения по всем найденным чанкам
         cand = []
@@ -246,6 +266,7 @@ def build_answer(query, k):
                 "id": h["id"], "doc": h["doc"],
                 "page_start": h["page_start"], "page_end": h["page_end"],
                 "section": h["section"], "score": h["score"],
+                "pdf_url": h.get("pdf_url"),
                 "snippet": S.make_snippet(h["text"], terms or list(stems), width=700),
                 "text": h["text"],
             })
@@ -321,6 +342,7 @@ def build_quiz(question, options):
                 "section": (row[4] or "").strip(),
                 "snippet": S.make_snippet(row[5], terms, width=650),
                 "text": row[5],
+                "pdf_url": pdf_ref(row[1]),
             }]
         # дополнительно: чанки по запросу «вопрос + правильный вариант»
         for h2 in retrieve(con, f"{question} {best['option']}", k=3)[0]:
@@ -330,6 +352,7 @@ def build_quiz(question, options):
                 "id": h2["id"], "doc": h2["doc"],
                 "page_start": h2["page_start"], "page_end": h2["page_end"],
                 "section": h2["section"],
+                "pdf_url": pdf_ref(h2["doc"]),
                 "snippet": S.make_snippet(h2["text"], terms, width=650),
                 "text": h2["text"],
             })
@@ -346,7 +369,8 @@ def build_quiz(question, options):
                 quotes.append({"text": s, "doc": ev["doc"],
                                "page_start": ev["page_start"],
                                "page_end": ev["page_end"],
-                               "section": ev["section"]})
+                               "section": ev["section"],
+                               "pdf_url": ev.get("pdf_url")})
                 break
             if len(quotes) >= 3:
                 break
@@ -451,6 +475,7 @@ class Handler(BaseHTTPRequestHandler):
                 con.close()
             return self._json({"ok": True, "chunks": chunks, "docs": docs,
                                "vector_search": VEC_MAT is not None,
+                               "pdf_docs": sorted(PDF_MAP.keys()),
                                "meta": META})
         if u.path == "/api/page":
             q = parse_qs(u.query)
@@ -470,6 +495,29 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": "not found"}, 404)
             return self._json({"doc": doc, "page": page,
                                "label": rows[0][1] or "", "text": rows[0][2]})
+        if u.path == "/api/pdfs":
+            return self._json({"pdfs": PDF_MAP})
+        if u.path == "/pdf":
+            q = parse_qs(u.query)
+            fname = (q.get("f") or [""])[0]
+            if fname not in PDF_MAP:
+                return self._json({"error": "unknown document"}, 404)
+            pdf_path = HERE / "pdf" / fname
+            if not pdf_path.exists():
+                return self._json({"error": "PDF file not found on server"}, 404)
+            data = pdf_path.read_bytes()
+            from urllib.parse import quote
+            ascii_name = fname.encode("ascii", "ignore").decode() or "document.pdf"
+            utf8_name = quote(fname)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/pdf")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Content-Disposition",
+                             f"inline; filename=\"{ascii_name}\"; filename*=UTF-8''{utf8_name}")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(data)
+            return
         return self._json({"error": "not found"}, 404)
 
     def do_POST(self):                                      # noqa: N802

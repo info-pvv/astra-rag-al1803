@@ -127,6 +127,7 @@
   <div class="tabs">
     <button class="tab active" data-tab="ask">Вопрос по курсу</button>
     <button class="tab" data-tab="quiz">Тест с выбором ответа</button>
+    <button class="tab" data-tab="docs">Документация (PDF)</button>
   </div>
 
   <!-- ============================= РЕЖИМ: ВОПРОС ============================= -->
@@ -171,9 +172,17 @@
     </div>
     <div id="quizOut"></div>
   </section>
+
+  <!-- ============================ РЕЖИМ: ДОКУМЕНТЫ ============================ -->
+  <section id="tab-docs" class="hidden">
+    <div class="card">
+      <div class="muted" style="margin-bottom:12px">Полный комплект документации курса. PDF открываются прямо в браузере.</div>
+      <div id="docsList" class="muted">Загрузка списка…</div>
+    </div>
+  </section>
 </main>
 
-<footer>Локальная база <code>kb.sqlite</code> · сервер слушает только 127.0.0.1</footer>
+  <footer>Локальная база <code>kb.sqlite</code> · сервер слушает только 127.0.0.1</footer>
 
 <dialog id="dlg">
   <div class="dh">
@@ -194,7 +203,33 @@ document.querySelectorAll(".tab").forEach(t => t.onclick = () => {
   t.classList.add("active");
   $("#tab-ask").classList.toggle("hidden", t.dataset.tab !== "ask");
   $("#tab-quiz").classList.toggle("hidden", t.dataset.tab !== "quiz");
+  $("#tab-docs").classList.toggle("hidden", t.dataset.tab !== "docs");
 });
+
+/* ------------------------- список PDF-документации ------------------------- */
+let PDF_LIST = {};
+fetch("/api/pdfs").then(r => r.json()).then(d => {
+  PDF_LIST = d.pdfs || {};
+  const box = $("#docsList");
+  const names = Object.keys(PDF_LIST);
+  if (!names.length) {
+    box.textContent = "PDF-файлы на сервер не загружены — доступны только текстовые фрагменты.";
+    return;
+  }
+  box.innerHTML = names.map(f =>
+    `<div class="src" style="display:flex;justify-content:space-between;align-items:center;gap:12px">
+      <div><b style="color:var(--txt)">${esc(PDF_LIST[f].title || f)}</b>
+        <div class="muted" style="font-size:12px">${f} · ~${PDF_LIST[f].size_mb} МБ</div></div>
+      <a href="/pdf?f=${encodeURIComponent(f)}" target="_blank"
+         style="color:var(--acc);text-decoration:none;white-space:nowrap">Открыть PDF →</a>
+    </div>`).join("");
+}).catch(() => {});
+
+function pdfLink(doc) {
+  if (PDF_LIST[doc]) return ` <a style="color:var(--acc);cursor:pointer;text-decoration:none"
+    href="/pdf?f=${encodeURIComponent(doc)}" target="_blank">[PDF]</a>`;
+  return "";
+}
 
 /* ------------------------------ состояние базы ---------------------------- */
 fetch("/api/health").then(r => r.json()).then(d => {
@@ -254,7 +289,7 @@ function renderAnswer(d) {
     d.answer.forEach(a => {
       h += `<div class="ans-item">${esc(a.text)}
         <div class="cite">Источник: <a onclick="openPage('${esc(a.doc)}', ${a.page_start})">
-        ${esc(a.doc)}, ${pages(a.page_start, a.page_end)}</a>
+        ${esc(a.doc)}, ${pages(a.page_start, a.page_end)}</a>${pdfLink(a.doc)}
         ${a.section ? " · " + esc(a.section) : ""}</div></div>`;
     });
   }
@@ -266,7 +301,7 @@ function renderAnswer(d) {
     d.sources.forEach(s => {
       h += `<div class="src">
         <div class="meta"><b>${esc(s.doc)}</b> — <a style="color:var(--acc);cursor:pointer"
-          onclick="openPage('${esc(s.doc)}', ${s.page_start})">${pages(s.page_start, s.page_end)}</a>
+          onclick="openPage('${esc(s.doc)}', ${s.page_start})">${pages(s.page_start, s.page_end)}</a>${pdfLink(s.doc)}
           ${s.section ? " · " + esc(s.section) : ""}</div>
         <div class="txt">${esc(s.snippet)}</div></div>`;
     });
@@ -387,7 +422,7 @@ function renderQuiz(d, markedIdx) {
     d.quotes.forEach(q => {
       h += `<div class="ans-item">${esc(q.text)}
         <div class="cite">Источник: <a onclick="openPage('${esc(q.doc)}', ${q.page_start})">
-        ${esc(q.doc)}, ${pages(q.page_start, q.page_end)}</a>
+        ${esc(q.doc)}, ${pages(q.page_start, q.page_end)}</a>${pdfLink(q.doc)}
         ${q.section ? " · " + esc(q.section) : ""}</div></div>`;
     });
     h += `</div>`;
@@ -398,7 +433,7 @@ function renderQuiz(d, markedIdx) {
     d.evidence.forEach(e => {
       h += `<div class="src">
         <div class="meta"><b>${esc(e.doc)}</b> — <a style="color:var(--acc);cursor:pointer"
-          onclick="openPage('${esc(e.doc)}', ${e.page_start})">${pages(e.page_start, e.page_end)}</a>
+          onclick="openPage('${esc(e.doc)}', ${e.page_start})">${pages(e.page_start, e.page_end)}</a>${pdfLink(e.doc)}
           ${e.section ? " · " + esc(e.section) : ""}</div>
         <div class="txt">${esc(e.snippet)}</div></div>`;
     });
