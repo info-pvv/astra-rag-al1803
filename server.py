@@ -47,6 +47,11 @@ BIND_HOST = os.environ.get("RAG_HOST", "127.0.0.1").strip()
 # (задаётся в настройках Space/хостинга). Если не установлен — доступ без пароля.
 ACCESS_KEY = os.environ.get("RAG_ACCESS_KEY", "").strip()
 
+# Нейросеть (Groq, бесплатный тариф): ключ и модель — только через переменные окружения.
+# Если GROQ_API_KEY не задан — запрос к нейросети вернёт подсказку о настройке.
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b").strip()
+
 # Карта «название документа → файл PDF» (pdf_map.json рядом с сервером).
 # Файл опционален: без него ссылки на PDF просто не показываются.
 # Поддерживаются алиасы (aliases) — короткие названия документов из базы.
@@ -412,6 +417,37 @@ def build_quiz(question, options):
         con.close()
 
 
+def groq_chat(prompt):
+    """Запрос к Groq (OpenAI-совместимый API). Возвращает (ответ, модель, ошибка)."""
+    import urllib.request
+    import urllib.error
+    body = json.dumps({
+        "model": GROQ_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.2,
+        "max_tokens": 2048,
+    }).encode("utf-8")
+    auth_header = "Bearer " + GROQ_API_KEY
+    req = urllib.request.Request(
+        "https://api.groq.com/openai/v1/chat/completions",
+        data=body, method="POST",
+        headers={"Authorization": auth_header,
+                 "Content-Type": "application/json",
+                 "User-Agent": "astra-rag/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=110) as r:
+            d = json.loads(r.read().decode("utf-8"))
+        return d["choices"][0]["message"]["content"].strip(), d.get("model", GROQ_MODEL), ""
+    except urllib.error.HTTPError as e:
+        try:
+            detail = json.loads(e.read().decode("utf-8")).get("error", {}).get("message", "")
+        except Exception:                                   # noqa: BLE001
+            detail = ""
+        return "", GROQ_MODEL, f"Ошибка Groq API (HTTP {e.code}): {detail or 'нет деталей'}"
+    except Exception as e:                                  # noqa: BLE001
+        return "", GROQ_MODEL, f"Не удалось обратиться к нейросети: {type(e).__name__}: {e}"
+
+
 # ------------------------------------------------------------------ сервер
 class Handler(BaseHTTPRequestHandler):
     server_version = "AL1803-RAG/1.0"
@@ -564,6 +600,20 @@ class Handler(BaseHTTPRequestHandler):
                 res = build_quiz(q, opts)
             return self._json(res)
 
+        if path == "/api/llm":
+            prompt = (data.get("prompt") or "").strip()
+            if not prompt:
+                return self._json({"error": "Пустой промпт"}, 400)
+            if not GROQ_API_KEY:
+                return self._json({
+                    "error": "Нейросеть не настроена на сервере: не задана переменная окружения GROQ_API_KEY.",
+                }, 503)
+            with _lock:
+                answer, model, err = groq_chat(prompt)
+            if err:
+                return self._json({"error": err}, 502)
+            return self._json({"answer": answer, "model": model})
+
         return self._json({"error": "not found"}, 404)
 
 
@@ -590,6 +640,10 @@ def main():
         print("  ключ доступа: установлен (переменная RAG_ACCESS_KEY)")
     else:
         print("  ключ доступа: НЕ установлен — страница открыта всем")
+    if GROQ_API_KEY:
+        print(f"  нейросеть (Groq): включена, модель {GROQ_MODEL}")
+    else:
+        print("  нейросеть (Groq): не настроена (нет GROQ_API_KEY)")
 
     srv = ThreadingHTTPServer((BIND_HOST, PORT), Handler)
     url = f"http://{BIND_HOST}:{PORT}/"

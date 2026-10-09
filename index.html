@@ -188,6 +188,7 @@
   <div class="dh">
     <b id="dlgTitle">Фрагмент документа</b>
     <div style="display:flex;gap:8px">
+      <button class="ghost mini" id="dlgLlm">🤖 Спросить нейросеть</button>
       <button class="ghost mini" id="dlgCopy">📋 Копировать</button>
       <button class="ghost mini" onclick="document.getElementById('dlg').close()">Закрыть</button>
     </div>
@@ -244,7 +245,7 @@ function showLlmPrompt(text) {
   dlg.showModal();
 }
 
-$("#dlgCopy").onclick = async () => {
+$( "#dlgCopy").onclick = async () => {
   const t = $("#dlgBody").textContent;
   try {
     await navigator.clipboard.writeText(t);
@@ -262,6 +263,36 @@ function flashCopy(msg) {
   const b = $("#dlgCopy"); const old = b.textContent;
   b.textContent = msg; setTimeout(() => b.textContent = old, 1600);
 }
+
+$("#dlgLlm").onclick = async () => {
+  const btn = $("#dlgLlm");
+  const body = $("#dlgBody");
+  const prompt = body.textContent;
+  const old = btn.textContent;
+  btn.disabled = true; btn.textContent = "⏳ Нейросеть думает…";
+  body.textContent = "Отправляю запрос в Groq (Llama 3.3 70B)… обычно 5–20 секунд.";
+  try {
+    const r = await fetch("/api/llm", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({prompt})
+    });
+    const d = await r.json();
+    if (d.answer) {
+      body.textContent = d.answer;
+      $("#dlgTitle").textContent = `Ответ нейросети (${d.model}) — источники в документации указаны как [n]`;
+      btn.textContent = "🔄 Отправить снова";
+    } else {
+      body.textContent = prompt;  // вернуть промпт
+      $("#dlgTitle").textContent = "Запрос для нейросети — вставьте в DeepSeek / ChatGPT";
+      btn.textContent = old;
+      alert(d.error || "Не удалось получить ответ нейросети.");
+    }
+  } catch (e) {
+    body.textContent = prompt;
+    alert("Ошибка сети: " + e);
+    btn.textContent = old;
+  } finally { btn.disabled = false; }
+};
 
 function ctxBlocks(items, maxChars) {
   let out = "", i = 0;
